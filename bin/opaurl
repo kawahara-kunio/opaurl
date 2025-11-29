@@ -1,0 +1,645 @@
+#!/usr/bin/env bash
+
+# opaurl - OAuth 2.0 Client Credentials Grant対応HTTPクライアント
+# 1Passwordから認証情報を取得し、自動的にトークンを取得してHTTPリクエストを実行
+
+set -euo pipefail
+
+# グローバル変数
+declare -A PROFILE_CACHE
+declare -a AVAILABLE_PROFILES
+DEBUG_MODE=false
+
+# ==============================================================================
+# 設定管理
+# ==============================================================================
+
+# 1Passwordから設定を取得
+# 引数:
+#   $1 - アイテム名（デフォルト: "opaurl profiles"）
+#   $2 - Vault名（オプション）
+# 戻り値: 設定内容（標準出力）
+config::fetch_from_1password() {
+    local item_name="${1:-opaurl profiles}"
+    local vault_name="${2:-}"
+    local profiles_content
+
+    # opコマンドを構築
+    local -a op_cmd=(op item get "$item_name" --field notesPlain)
+
+    # Vault名が指定されている場合は追加
+    if [[ -n "$vault_name" ]]; then
+        op_cmd+=(--vault "$vault_name")
+    fi
+
+    # デバッグモード: opコマンドのリクエストを表示
+    if [[ "$DEBUG_MODE" == true ]]; then
+        echo "[DEBUG] 1Password コマンド実行:" >&2
+        echo "[DEBUG]   ${op_cmd[*]}" >&2
+    fi
+
+    if ! profiles_content=$("${op_cmd[@]}" 2>&1); then
+        echo "エラー: 1Passwordから設定を取得できませんでした。" >&2
+        echo "アイテム名: $item_name" >&2
+        if [[ -n "$vault_name" ]]; then
+            echo "Vault名: $vault_name" >&2
+        fi
+        echo "1Password CLIにサインインしてください (実行: op signin)" >&2
+        echo "エラー詳細: $profiles_content" >&2
+        return 1
+    fi
+
+    # 先頭と末尾の引用符を削除（1Passwordが引用符で囲んで返す場合がある）
+    profiles_content="${profiles_content#\"}"
+    profiles_content="${profiles_content%\"}"
+
+    if [[ "$DEBUG_MODE" == true ]]; then
+        echo "[DEBUG] 1Password レスポンス:" >&2
+        echo "$profiles_content" | sed 's/^/[DEBUG]   /' >&2
+        echo "" >&2
+    fi
+
+    echo "$profiles_content"
+}
+
+# INI形式からプロファイル一覧を抽出
+# 引数: $1 - 設定内容
+# 戻り値: プロファイル名の配列を AVAILABLE_PROFILES にセット
+config::extract_profiles() {
+    local profiles_content="$1"
+    AVAILABLE_PROFILES=()
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^\[([^]]+)\] ]]; then
+            AVAILABLE_PROFILES+=("${BASH_REMATCH[1]}")
+        fi
+    done <<< "$profiles_content"
+}
+
+# 特定プロファイルの設定を解析
+# 引数: $1 - 設定内容, $2 - プロファイル名
+# 戻り値: 設定を PROFILE_CACHE に格納
+config::parse_profile() {
+    local profiles_content="$1"
+    local profile_name="$2"
+    local in_section=false
+
+    PROFILE_CACHE=()
+
+    while IFS= read -r line; do
+        # 空行とコメントをスキップ
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # セクション開始
+        if [[ "$line" =~ ^\[([^]]+)\] ]]; then
+            if [[ "${BASH_REMATCH[1]}" == "$profile_name" ]]; then
+                in_section=true
+            else
+                in_section=false
+            fi
+            continue
+        fi
+
+        # セクション内のキー=値を解析
+        if [[ "$in_section" == true && "$line" =~ ^[[:space:]]*([^=]+)[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            # 前後の空白を削除
+            key="${key#"${key%%[![:space:]]*}"}"
+            key="${key%"${key##*[![:space:]]}"}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            PROFILE_CACHE["$key"]="$value"
+        fi
+    done <<< "$profiles_content"
+
+    if [[ ${#PROFILE_CACHE[@]} -eq 0 ]]; then
+        echo "エラー: プロファイル '$profile_name' が設定に見つかりませんでした。" >&2
+        return 1
+    fi
+}
+
+# 利用可能なプロファイル一覧を表示
+# 引数:
+#   $1 - アイテム名（デフォルト: "opaurl profiles"）
+#   $2 - Vault名（オプション）
+config::list_profiles() {
+    local item_name="${1:-opaurl profiles}"
+    local vault_name="${2:-}"
+    local profiles_content
+
+    profiles_content=$(config::fetch_from_1password "$item_name" "$vault_name") || return 1
+    config::extract_profiles "$profiles_content"
+
+    if [[ ${#AVAILABLE_PROFILES[@]} -eq 0 ]]; then
+        echo "プロファイルが見つかりませんでした。"
+        return 0
+    fi
+
+    echo "利用可能なプロファイル:"
+    for profile in "${AVAILABLE_PROFILES[@]}"; do
+        echo "  - $profile"
+    done
+}
+
+# 必須設定項目を検証
+# 戻り値: すべての必須項目が存在する場合は0、それ以外は1
+config::validate() {
+    local required_keys=("auth_server_token_endpoint" "client_id" "client_secret")
+    local missing_keys=()
+
+    for key in "${required_keys[@]}"; do
+        if [[ -z "${PROFILE_CACHE[$key]:-}" ]]; then
+            missing_keys+=("$key")
+        fi
+    done
+
+    if [[ ${#missing_keys[@]} -gt 0 ]]; then
+        echo "エラー: 必須の設定項目が不足しています: ${missing_keys[*]}" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# ==============================================================================
+# アクセストークン取得
+# ==============================================================================
+
+# トークンエンドポイントからレスポンスを取得（共通処理）
+# 引数: なし（PROFILE_CACHEから設定を取得）
+# 戻り値: トークンレスポンスボディ（標準出力）
+auth::fetch_token_response() {
+    local auth_server_token_endpoint="${PROFILE_CACHE[auth_server_token_endpoint]}"
+    local client_id="${PROFILE_CACHE[client_id]}"
+    local client_secret="${PROFILE_CACHE[client_secret]}"
+    local scopes="${PROFILE_CACHE[scopes]}"
+
+    # Basic認証用のクレデンシャルを作成
+    local credentials
+    credentials=$(echo -n "$client_id:$client_secret" | base64)
+
+    # curlコマンドを構築
+    local -a token_curl_cmd=(
+        curl -s -S -w "\n%{http_code}" -X POST "$auth_server_token_endpoint"
+        -H "Authorization: Basic $credentials"
+        -H "Content-Type: application/x-www-form-urlencoded"
+        -d "grant_type=client_credentials"
+    )
+
+    # デバッグモードの場合は--verboseを追加
+    if [[ "$DEBUG_MODE" == true ]]; then
+        token_curl_cmd+=(--verbose)
+    fi
+
+    # scopeが空でない場合のみ追加
+    if [[ -n "$scopes" ]]; then
+        token_curl_cmd+=(-d "scope=$scopes")
+    fi
+
+    # curlでトークンリクエストを送信
+    local response
+    if [[ "$DEBUG_MODE" == true ]]; then
+        # デバッグモード: --verbose出力を標準エラー出力に直接出す
+        response=$("${token_curl_cmd[@]}") || {
+            echo "エラー: トークンエンドポイントへの接続に失敗しました。" >&2
+            echo "エンドポイント: $auth_server_token_endpoint" >&2
+            return 1
+        }
+    else
+        # 通常モード: エラーメッセージを標準エラー出力にリダイレクト
+        response=$("${token_curl_cmd[@]}" 2>&1) || {
+            echo "エラー: トークンエンドポイントへの接続に失敗しました。" >&2
+            echo "エンドポイント: $auth_server_token_endpoint" >&2
+            return 1
+        }
+    fi
+
+    # HTTPステータスコードとレスポンスボディを分離
+    local http_code
+    local response_body
+    http_code=$(echo "$response" | tail -n 1)
+    response_body=$(echo "$response" | sed '$d')
+
+    # HTTPステータスコードをチェック
+    if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+        echo "エラー: トークンリクエストが失敗しました (HTTP $http_code)" >&2
+        echo "レスポンス: $response_body" >&2
+        return 1
+    fi
+
+    # レスポンスボディを返す
+    echo "$response_body"
+}
+
+# トークン取得（access_tokenのみを抽出）
+# 引数: なし（PROFILE_CACHEから設定を取得）
+# 戻り値: アクセストークン（標準出力）
+auth::get_token() {
+    local response_body
+    response_body=$(auth::fetch_token_response) || return 1
+
+    # JSONレスポンスからaccess_tokenを抽出
+    local access_token
+    access_token=$(echo "$response_body" | jq -r '.access_token // empty') || {
+        echo "エラー: JSONレスポンスの解析に失敗しました。" >&2
+        return 1
+    }
+
+    if [[ -z "$access_token" ]]; then
+        echo "エラー: レスポンスにaccess_tokenが見つかりませんでした。" >&2
+        echo "レスポンス: $response_body" >&2
+        return 1
+    fi
+
+    echo "$access_token"
+}
+
+# キャッシュされたトークンから有効なaccess_tokenを取得
+# 引数: $1 - プロファイル環境変数名
+# 戻り値: access_token（有効な場合）、空文字列（無効または期限切れの場合）
+auth::get_access_token_from_cache() {
+    local profile_env_var_name="$1"
+    local cached_token_response="${!profile_env_var_name:-}"
+
+    # キャッシュが存在しない場合
+    if [[ -z "$cached_token_response" ]]; then
+        return 1
+    fi
+
+    # 有効期限をチェック
+    local expires_at
+    expires_at=$(echo "$cached_token_response" | jq -r '.expires_at // 0')
+    local current_time
+    current_time=$(date +%s)
+
+    # 現在時刻 + 10秒が有効期限を超えている場合は期限切れ扱い
+    if [[ $((current_time + 10)) -ge $expires_at ]]; then
+        if [[ "$DEBUG_MODE" == true ]]; then
+            echo "[DEBUG] キャッシュされたトークンは期限切れまたは期限切れ間近です" >&2
+            echo "[DEBUG] 現在時刻: $current_time, 有効期限: $expires_at" >&2
+            echo "" >&2
+        fi
+        return 1
+    fi
+
+    # 有効なトークン - access_tokenを抽出
+    if [[ "$DEBUG_MODE" == true ]]; then
+        local remaining=$((expires_at - current_time))
+        echo "[DEBUG] キャッシュされたトークンは有効です（残り${remaining}秒）" >&2
+        echo "" >&2
+    fi
+
+    local access_token
+    access_token=$(echo "$cached_token_response" | jq -r '.access_token // empty') || return 1
+
+    if [[ -z "$access_token" ]]; then
+        return 1
+    fi
+
+    echo "$access_token"
+}
+
+# トークンレスポンスにexpires_atと設定情報を追加
+# 引数: $1 - トークンレスポンスJSON
+# 戻り値: expires_at、default_content_type、default_user_agentを追加したJSON
+auth::add_expires_at() {
+    local response_body="$1"
+    local current_time
+    current_time=$(date +%s)
+    local expires_in
+    expires_in=$(echo "$response_body" | jq -r '.expires_in // 0')
+    local expires_at=$((current_time + expires_in))
+
+    # PROFILE_CACHEから設定値を取得（デフォルト値を設定）
+    local default_content_type="application/json"
+    local default_user_agent="opaurl/1.0"
+
+    # PROFILE_CACHE配列が定義されている場合のみ値を取得
+    if declare -p PROFILE_CACHE &>/dev/null; then
+        if [[ -n "${PROFILE_CACHE[default_content_type]:-}" ]]; then
+            default_content_type="${PROFILE_CACHE[default_content_type]}"
+        fi
+
+        if [[ -n "${PROFILE_CACHE[default_user_agent]:-}" ]]; then
+            default_user_agent="${PROFILE_CACHE[default_user_agent]}"
+        fi
+    fi
+
+    echo "$response_body" | jq -c \
+        --arg expires_at "$expires_at" \
+        --arg default_content_type "$default_content_type" \
+        --arg default_user_agent "$default_user_agent" \
+        '. + {expires_at: ($expires_at | tonumber), default_content_type: $default_content_type, default_user_agent: $default_user_agent}'
+}
+
+# プロファイル環境変数名を生成
+# 引数: $1 - プロファイル名
+# 戻り値: プロファイル環境変数名（OPAURL_xxx形式、ハイフンはアンダースコアに変換）
+auth::get_profile_var_name() {
+    local profile_name="$1"
+    echo "OPAURL_${profile_name//-/_}"
+}
+
+# ==============================================================================
+# HTTPリクエスト
+# ==============================================================================
+
+# HTTPリクエストを実行
+# 引数:
+#   $1 - URL
+#   $2 - アクセストークン
+#   $3 - HTTPメソッド（オプション、デフォルト: GET）
+#   $4 - リクエストボディ（オプション）
+# その他の引数: カスタムヘッダー（-H "Header: Value" 形式）とcurlオプション
+# 戻り値: curlのレスポンスをそのまま標準出力に返す
+http::request() {
+    local url="$1"
+    local access_token="$2"
+    local method="${3:-GET}"
+    local request_body="${4:-}"
+    shift 4 || true
+
+    # カスタムヘッダーとcurlオプションを配列に格納
+    local -a custom_headers=()
+    local -a extra_curl_options=()
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "-H" && -n "${2:-}" ]]; then
+            custom_headers+=("-H" "$2")
+            shift 2
+        else
+            # -H以外はcurlオプションとして扱う
+            extra_curl_options+=("$1")
+            shift
+        fi
+    done
+
+    if ! command -v curl &> /dev/null; then
+        echo "エラー: curlがインストールされていません。" >&2
+        return 1
+    fi
+
+    # Content-TypeとUser-Agentを設定（PROFILE_CACHEから取得、なければデフォルト）
+    local content_type="${PROFILE_CACHE[default_content_type]:-application/json}"
+    local user_agent="${PROFILE_CACHE[default_user_agent]:-opaurl/1.0}"
+
+    # curlコマンドを構築
+    local -a curl_cmd=(
+        curl
+        -s
+        -X "$method"
+        -H "Authorization: Bearer $access_token"
+        -H "Content-Type: $content_type"
+        -H "User-Agent: $user_agent"
+    )
+
+    # カスタムヘッダーを追加（デフォルトヘッダーを上書き可能にするため最後に追加）
+    if [[ ${#custom_headers[@]} -gt 0 ]]; then
+        curl_cmd+=("${custom_headers[@]}")
+    fi
+
+    # リクエストボディがある場合は追加
+    if [[ -n "$request_body" ]]; then
+        curl_cmd+=(-d "$request_body")
+    fi
+
+    # デバッグモードの場合は--verboseを追加
+    if [[ "$DEBUG_MODE" == true ]]; then
+        curl_cmd+=(--verbose)
+    fi
+
+    # 追加のcurlオプションを追加
+    if [[ ${#extra_curl_options[@]} -gt 0 ]]; then
+        curl_cmd+=("${extra_curl_options[@]}")
+    fi
+
+    # URLを追加
+    curl_cmd+=("$url")
+
+    # リクエストを実行してレスポンスをそのまま返す
+    "${curl_cmd[@]}"
+}
+
+# ==============================================================================
+# CLIインターフェース
+# ==============================================================================
+
+# ヘルプメッセージを表示
+show_help() {
+    cat << EOF
+Usage: opaurl [OPTIONS] URL
+
+OAuth 2.0 Client Credentials Grant対応HTTPクライアント
+
+Options:
+  -p, --profile PROFILE  使用するプロファイルを指定（1Passwordの設定セクション名）
+  -X, --request METHOD   HTTPメソッドを指定（GET, POST, PUT, DELETE, PATCH）
+                         デフォルト: GET
+  -d, --data DATA        リクエストボディを指定
+                         - 文字列: '{"key":"value"}'
+                         - ファイル: @filename
+                         - 標準入力: @-
+  -H, --header HEADER    カスタムヘッダーを追加（複数指定可能）
+                         例: -H "X-Custom-Header: value"
+  --get-token            トークンを環境変数形式で出力（eval用）
+  --list-profiles        利用可能なプロファイル一覧を表示
+  --debug                デバッグモード（opコマンドの詳細を表示）
+  -h, --help             このヘルプを表示
+
+Note:
+  上記以外のオプション（-v, -i, --compressed等）はcurlに直接渡されます
+
+Examples:
+  # GETリクエスト
+  opaurl -p production https://api.example.com/users
+
+  # POSTリクエストを実行
+  opaurl -p production -X POST -d '{"name":"test"}' https://api.example.com/users
+
+  # ファイルからリクエストボディを指定
+  opaurl -p production -X POST -d @request.json https://api.example.com/users
+
+  # 標準入力からリクエストボディを指定
+  echo '{"name":"test"}' | opaurl -p production -X POST -d @- https://api.example.com/users
+
+  # カスタムヘッダーを追加
+  opaurl -p production -H "X-Custom-Header: value" https://api.example.com/data
+
+  # トークンを環境変数に保存
+  eval "\$(opaurl -p production --get-token)"
+  echo \$OPAURL_production | jq -r '.access_token'
+
+  # デバッグモードで実行
+  opaurl -p production --debug https://api.example.com/users
+
+  # curlのオプションを使用（詳細表示）
+  opaurl -p production -v https://api.example.com/users
+
+  # curlのオプションを使用（レスポンスヘッダーを表示）
+  opaurl -p production -i https://api.example.com/users
+
+  # 利用可能なプロファイル一覧を表示
+  opaurl --list-profiles
+
+Environment:
+  OPAURL_ITEM_NAME      1Passwordのアイテム名（デフォルト: "opaurl profiles"）
+  OPAURL_VAULT          1PasswordのVault名（未設定の場合はすべてのVaultを検索）
+
+EOF
+}
+
+# メイン処理
+main() {
+    local profile_name=""
+    local item_name="${OPAURL_ITEM_NAME:-opaurl profiles}"
+    local vault_name="${OPAURL_VAULT:-}"
+    local method="GET"
+    local request_body=""
+    local url=""
+    local -a custom_headers=()
+    local -a curl_options=()
+    local list_profiles=false
+    local get_token_only=false
+
+    # コマンドライン引数を解析
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p|--profile)
+                profile_name="$2"
+                shift 2
+                ;;
+            -X|--request)
+                method="$2"
+                shift 2
+                ;;
+            -d|--data)
+                request_body="$2"
+                shift 2
+                ;;
+            -H|--header)
+                custom_headers+=("-H" "$2")
+                shift 2
+                ;;
+            --get-token)
+                get_token_only=true
+                shift
+                ;;
+            --list-profiles)
+                list_profiles=true
+                shift
+                ;;
+            --debug)
+                DEBUG_MODE=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -*)
+                # 未知のオプションはcurlに渡す
+                if [[ -n "${2:-}" && ! "$2" =~ ^- ]]; then
+                    # 引数を取るオプション
+                    curl_options+=("$1" "$2")
+                    shift 2
+                else
+                    # 引数を取らないオプション
+                    curl_options+=("$1")
+                    shift
+                fi
+                ;;
+            *)
+                if [[ -z "$url" ]]; then
+                    url="$1"
+                else
+                    echo "エラー: 複数のURLが指定されています: $url と $1" >&2
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # プロファイル一覧表示モード
+    if [[ "$list_profiles" == true ]]; then
+        config::list_profiles "$item_name" "$vault_name"
+        exit 0
+    fi
+
+    # プロファイル名が指定されていない場合はエラー
+    if [[ -z "$profile_name" ]]; then
+        echo "エラー: プロファイル名が必要です。" >&2
+        echo "-p/--profile オプションでプロファイルを指定してください。" >&2
+        echo "利用可能なプロファイル一覧を確認するには --list-profiles を使用してください。" >&2
+        exit 1
+    fi
+
+    # トークン取得モード（環境変数の形式で出力）
+    if [[ "$get_token_only" == true ]]; then
+        # 設定をロード
+        local profiles_content
+        profiles_content=$(config::fetch_from_1password "$item_name" "$vault_name") || exit 1
+        config::parse_profile "$profiles_content" "$profile_name" || exit 1
+        config::validate || exit 1
+
+        local response_body
+        response_body=$(auth::fetch_token_response) || exit 1
+
+        # expires_atと設定情報を追加
+        local response_with_expiry
+        response_with_expiry=$(auth::add_expires_at "$response_body")
+
+        # プロファイル環境変数名を生成
+        local profile_env_var_name
+        profile_env_var_name=$(auth::get_profile_var_name "$profile_name")
+
+        # exportコマンドで出力（ユーザーがevalで実行する）
+        echo "export $profile_env_var_name='$response_with_expiry'"
+        exit 0
+    fi
+
+    # HTTPリクエストモード: URLが指定されていない場合はエラー
+    if [[ -z "$url" ]]; then
+        echo "エラー: URLが必要です。" >&2
+        echo "使い方を確認するには -h または --help を使用してください。" >&2
+        exit 1
+    fi
+
+    # HTTPリクエストモード: キャッシュをチェック（1Passwordアクセスを回避）
+    local profile_env_var_name
+    profile_env_var_name=$(auth::get_profile_var_name "$profile_name")
+    local access_token
+
+    # キャッシュから有効なトークンを取得
+    if ! access_token=$(auth::get_access_token_from_cache "$profile_env_var_name"); then
+        # キャッシュミス - 新規トークンを取得
+        if [[ "$DEBUG_MODE" == true ]]; then
+            echo "[DEBUG] キャッシュミスのため、新規トークンを取得します" >&2
+            echo "" >&2
+        fi
+
+        # 設定をロード
+        local profiles_content
+        profiles_content=$(config::fetch_from_1password "$item_name" "$vault_name") || exit 1
+        config::parse_profile "$profiles_content" "$profile_name" || exit 1
+        config::validate || exit 1
+
+        # トークンを新規取得
+        access_token=$(auth::get_token) || exit 1
+    else
+        # キャッシュヒット - キャッシュから設定情報を取得してPROFILE_CACHEに設定
+        local cached_token_response="${!profile_env_var_name}"
+        declare -gA PROFILE_CACHE=(
+            [default_content_type]=$(echo "$cached_token_response" | jq -r '.default_content_type // "application/json"')
+            [default_user_agent]=$(echo "$cached_token_response" | jq -r '.default_user_agent // "opaurl/1.0"')
+        )
+    fi
+
+    # HTTPリクエストを実行
+    http::request "$url" "$access_token" "$method" "$request_body" "${custom_headers[@]}" "${curl_options[@]}"
+}
+
+# メイン処理を実行（スクリプトが直接実行された場合のみ）
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

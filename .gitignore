@@ -1,0 +1,21 @@
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.log
+test_output/
+tests/.test_temp
+
+# Temporary files
+*.tmp
+temp/
+
+.claude/settings.local.json
