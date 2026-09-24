@@ -146,6 +146,8 @@ teardown() {
     unset -f curl
 }
 
+# curlは同名の-Hを後勝ちで上書きせず両方送るため、
+# オーバーライド時はカスタムヘッダが「ちょうど1つだけ」渡ることを確認する
 @test "http::request ヘッダオーバーライド：Content-TypeとUser-Agentのオーバーライドを許可する" {
     declare -A PROFILE_CACHE=(
         [default_user_agent]="DefaultAgent/1.0"
@@ -164,15 +166,104 @@ teardown() {
 
     local count
     count=$(grep -c "^Content-Type:" "$curl_args_file" || true)
-    [ "$count" -ge 1 ]
+    [ "$count" -eq 1 ]
     grep -q "Content-Type: text/plain" "$curl_args_file"
 
     # 2. User-Agentヘッダのオーバーライド
     http::request "https://api.example.com/data" "token-xyz" "GET" "" -H "User-Agent: CustomAgent/2.0" > /dev/null
 
     count=$(grep -c "^User-Agent:" "$curl_args_file" || true)
-    [ "$count" -ge 1 ]
+    [ "$count" -eq 1 ]
     grep -q "User-Agent: CustomAgent/2.0" "$curl_args_file"
+
+    unset -f curl
+}
+
+# ヘッダ名は大文字小文字を区別せず、前後の空白やcurlの「名前;」記法でも
+# デフォルトヘッダを積まないことを確認する
+@test "http::request ヘッダオーバーライド：表記ゆれがあってもデフォルトのContent-Typeを送らない" {
+    declare -A PROFILE_CACHE=(
+        [default_user_agent]="DefaultAgent/1.0"
+    )
+
+    local curl_args_file=$(get_temp_file)
+
+    curl() {
+        printf '%s\n' "$@" > "$curl_args_file"
+        echo '{"result":"ok"}'
+    }
+    export -f curl
+
+    local count
+
+    # 1. ヘッダ名が小文字
+    http::request "https://api.example.com/data" "token-xyz" "PATCH" '{"a":1}' -H "content-type: application/merge-patch+json" > /dev/null
+
+    grep -q "content-type: application/merge-patch+json" "$curl_args_file"
+    count=$(grep -c "^Content-Type: application/json$" "$curl_args_file" || true)
+    [ "$count" -eq 0 ]
+
+    # 2. ヘッダ名の前後に空白
+    http::request "https://api.example.com/data" "token-xyz" "PATCH" '{"a":1}' -H "  Content-Type  : application/merge-patch+json" > /dev/null
+
+    grep -q "Content-Type  : application/merge-patch+json" "$curl_args_file"
+    count=$(grep -c "^Content-Type: application/json$" "$curl_args_file" || true)
+    [ "$count" -eq 0 ]
+
+    # 3. curlの「名前;」記法（値が空のヘッダを送る）
+    http::request "https://api.example.com/data" "token-xyz" "PATCH" '{"a":1}' -H "Content-Type;" > /dev/null
+
+    grep -q "Content-Type;" "$curl_args_file"
+    count=$(grep -c "^Content-Type: application/json$" "$curl_args_file" || true)
+    [ "$count" -eq 0 ]
+
+    unset -f curl
+}
+
+@test "http::request ヘッダオーバーライド：Authorizationをオーバーライドできる" {
+    declare -A PROFILE_CACHE=(
+        [default_user_agent]="DefaultAgent/1.0"
+    )
+
+    local curl_args_file=$(get_temp_file)
+
+    curl() {
+        printf '%s\n' "$@" > "$curl_args_file"
+        echo '{"result":"ok"}'
+    }
+    export -f curl
+
+    http::request "https://api.example.com/data" "token-xyz" "GET" "" -H "Authorization: Basic dXNlcjpwYXNz" > /dev/null
+
+    local count
+    count=$(grep -c "^Authorization:" "$curl_args_file" || true)
+    [ "$count" -eq 1 ]
+    grep -q "Authorization: Basic dXNlcjpwYXNz" "$curl_args_file"
+    count=$(grep -c "^Authorization: Bearer token-xyz$" "$curl_args_file" || true)
+    [ "$count" -eq 0 ]
+
+    unset -f curl
+}
+
+@test "http::request ヘッダオーバーライド：無関係なカスタムヘッダはデフォルトヘッダを残す" {
+    declare -A PROFILE_CACHE=(
+        [default_user_agent]="DefaultAgent/1.0"
+    )
+
+    local curl_args_file=$(get_temp_file)
+
+    curl() {
+        printf '%s\n' "$@" > "$curl_args_file"
+        echo '{"result":"ok"}'
+    }
+    export -f curl
+
+    http::request "https://api.example.com/data" "token-xyz" "GET" "" -H "X-Request-Id: abc123" > /dev/null
+
+    grep -q "X-Request-Id: abc123" "$curl_args_file"
+    grep -q "Authorization: Bearer token-xyz" "$curl_args_file"
+    grep -q "Content-Type: application/json" "$curl_args_file"
+    grep -q "User-Agent: DefaultAgent/1.0" "$curl_args_file"
 
     unset -f curl
 }

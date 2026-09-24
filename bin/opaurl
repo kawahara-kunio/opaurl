@@ -383,17 +383,43 @@ http::request() {
     local content_type="${PROFILE_CACHE[default_content_type]:-application/json}"
     local user_agent="${PROFILE_CACHE[default_user_agent]:-opaurl/1.0}"
 
+    # カスタムヘッダーで指定されたヘッダー名を集める。
+    # curlは同名の-Hを後勝ちで上書きせず両方送るため、単に後ろへ追加するだけでは
+    # デフォルトヘッダーを上書きできない（サーバ側は先頭のヘッダーを採用しうる）。
+    # そこで同名のデフォルトヘッダーは最初から積まないようにする
+    local -A custom_header_names=()
+    local header_index
+    for ((header_index = 1; header_index < ${#custom_headers[@]}; header_index += 2)); do
+        # 「名前: 値」から名前部分を取り出す。curlの「名前;」記法（空値ヘッダー）にも対応する
+        local custom_header_name="${custom_headers[header_index]%%:*}"
+        custom_header_name="${custom_header_name%;}"
+        # 前後の空白を除去する
+        custom_header_name="${custom_header_name#"${custom_header_name%%[![:space:]]*}"}"
+        custom_header_name="${custom_header_name%"${custom_header_name##*[![:space:]]}"}"
+        # ヘッダー名は大文字小文字を区別しないため小文字で保持する
+        custom_header_names["${custom_header_name,,}"]=1
+    done
+
     # curlコマンドを構築
     local -a curl_cmd=(
         curl
         -s
         -X "$method"
-        -H "Authorization: Bearer $access_token"
-        -H "Content-Type: $content_type"
-        -H "User-Agent: $user_agent"
     )
 
-    # カスタムヘッダーを追加（デフォルトヘッダーを上書き可能にするため最後に追加）
+    # デフォルトヘッダーを追加（カスタムヘッダーで同名が指定されているものは除く）
+    local default_header default_header_name
+    for default_header in \
+        "Authorization: Bearer $access_token" \
+        "Content-Type: $content_type" \
+        "User-Agent: $user_agent"; do
+        default_header_name="${default_header%%:*}"
+        if [[ -z "${custom_header_names[${default_header_name,,}]:-}" ]]; then
+            curl_cmd+=(-H "$default_header")
+        fi
+    done
+
+    # カスタムヘッダーを追加
     if [[ ${#custom_headers[@]} -gt 0 ]]; then
         curl_cmd+=("${custom_headers[@]}")
     fi
